@@ -1,0 +1,9 @@
+services:
+  bot:
+    build:
+      context: ./bot
+    env_file:
+      - ./.env
+    network_mode: 'host'
+    volumes:
+      - ./bot:/app
