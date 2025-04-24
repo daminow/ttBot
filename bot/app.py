@@ -156,14 +156,35 @@ async def auth_login(update, ctx):
 async def auth_pass(update, ctx):
     pwd = update.message.text.strip()
     login = ctx.user_data.get("login_try")
+
     async for s in get_session():
-        adm = (await s.execute(select(Administrator).where(Administrator.username==login))).scalar_one_or_none()
-        if adm and bcrypt.verify(pwd, adm.password):
-            adm.telegram_id = update.effective_user.id
-            await s.commit()
-            ctx.user_data.update({"admin_id": adm.id, "role": adm.role})
-            return await show_home(update, ctx)
-    await update.message.reply_text("❌ Неверно. Попробуйте снова:", reply_markup=InlineKeyboardMarkup([[back_btn()]]))
+        adm = (await s.execute(
+            select(Administrator).where(Administrator.username == login)
+        )).scalar_one_or_none()
+        if not adm:
+            break
+
+        # verify bcrypt, but if the stored value isn't a valid hash,
+        # fall back to plain-text compare—no re-hashing!
+        try:
+            valid = bcrypt.verify(pwd, adm.password)
+        except ValueError:
+            valid = (pwd == adm.password)
+
+        if not valid:
+            break
+
+        # successful login → only update telegram_id
+        adm.telegram_id = update.effective_user.id
+        await s.commit()
+        ctx.user_data.update({"admin_id": adm.id, "role": adm.role})
+        return await show_home(update, ctx)
+
+    # failed login
+    await update.message.reply_text(
+        "❌ Неверно. Попробуйте снова:",
+        reply_markup=InlineKeyboardMarkup([[back_btn()]])
+    )
     return AUTH_LOGIN
 
 # ========= MAIN MENU =========
@@ -527,13 +548,27 @@ async def change_pass_start(update, ctx):
 
 async def change_pass_old(update, ctx):
     old = update.message.text.strip()
-    if old.lower()=="назад":
+    if old.lower() == "назад":
         return await settings_cb(update, ctx)
+
     async for s in get_session():
         adm = await s.get(Administrator, ctx.user_data["admin_id"])
-        if not bcrypt.verify(old, adm.password):
-            return await update.message.reply_text("❌ Неверный пароль.", reply_markup=InlineKeyboardMarkup([[back_btn()]]))
-    await update.message.reply_text("🔒 Введите новый пароль:", reply_markup=InlineKeyboardMarkup([[back_btn("settings")]]))
+
+        try:
+            valid = bcrypt.verify(old, adm.password)
+        except ValueError:
+            valid = (old == adm.password)
+
+        if not valid:
+            return await update.message.reply_text(
+                "❌ Неверный пароль.",
+                reply_markup=InlineKeyboardMarkup([[back_btn()]])
+            )
+
+    await update.message.reply_text(
+        "🔒 Введите новый пароль:",
+        reply_markup=InlineKeyboardMarkup([[back_btn("settings")]])
+    )
     return CHP_NEW
 
 async def change_pass_new(update, ctx):
