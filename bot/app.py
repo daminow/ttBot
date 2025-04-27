@@ -328,26 +328,26 @@ async def active_cb(update, ctx):
 
 
 # ---------- TOURNAMENT MENU ----------
-
 async def send_tournament_menu(update, ctx, tid):
+    """
+    Показывает меню турнира.
+    Для завершённых турниров – только кнопку «История игр».
+    Для активных и регистрационных – стандартное меню.
+    """
     ctx.user_data["tid"] = tid
 
-    # Загружаем турнир, активный раунд и всех игроков
+    # Загрузка данных
     async for s in get_session():
         tour = await s.get(Tournament, tid)
-        active_rnd = (
-            await s.execute(
-                select(Round)
-                .where(Round.tournament_id == tid, Round.status == "pending")
-            )
-        ).scalar_one_or_none()
-        players = (
-            await s.execute(
-                select(Player).where(Player.tournament_id == tid)
-            )
-        ).scalars().all()
+        players = (await s.execute(
+            select(Player).where(Player.tournament_id == tid)
+        )).scalars().all()
+        active_rnd = (await s.execute(
+            select(Round)
+            .where(Round.tournament_id == tid, Round.status == "pending")
+        )).scalar_one_or_none()
 
-    # Базовый текст
+    # Заголовок
     txt = (
         f"🏆 <b>{tour.name}</b>\n"
         f"📂 Тип: {tour.tournament_type}\n"
@@ -355,49 +355,72 @@ async def send_tournament_menu(update, ctx, tid):
         f"👥 Игроков: {len(players)}\n"
         f"📌 Статус: {tour.status}\n"
     )
-    kb = []
 
-    if not active_rnd:
-        kb.append([InlineKeyboardButton("▶️ Начать простой", callback_data="round_simple")])
-        kb.append([InlineKeyboardButton("▶️ Начать итоговый", callback_data="round_final")])
+    kb: list[list[InlineKeyboardButton]] = []
+
+    if tour.status == "ended":
+        # Для завершённого турнира – только история игр
+        kb.append([InlineKeyboardButton("📖 История игр", callback_data=f"rounds_{tid}")])
+
     else:
-        # Все матчи этого раунда
+        # Регистрация/активный турнир: прежний функционал
+        simple_done = None
         async for s in get_session():
-            matches_all = (
-                await s.execute(
-                    select(Match).where(Match.round_id == active_rnd.id)
+            simple_done = (await s.execute(
+                select(Round)
+                .where(
+                    Round.tournament_id == tid,
+                    Round.round_type == "simple",
+                    Round.status == "done"
                 )
-            ).scalars().all()
+                .order_by(Round.created_at.desc())
+            )).scalars().first()
 
-        tables_count = tour.data["tables"]
-        playing     = [m for m in matches_all if m.status == "playing"]
-        done        = [m for m in matches_all if m.status == "done"]
+        if not active_rnd:
+            # Нет текущего раунда
+            if simple_done:
+                # Простая часть завершена – предлагаем итоговый
+                kb.append([InlineKeyboardButton("▶️ Начать итоговый", callback_data="round_final")])
+            else:
+                # До первого раунда – и простой, и итоговый
+                kb.append([InlineKeyboardButton("▶️ Начать простой", callback_data="round_simple")])
+                kb.append([InlineKeyboardButton("▶️ Начать итоговый", callback_data="round_final")])
+        else:
+            # Есть незавершённый раунд – показываем статистику и кнопки
+            async for s in get_session():
+                matches_all = (await s.execute(
+                    select(Match).where(Match.round_id == active_rnd.id)
+                )).scalars().all()
+            playing = [m for m in matches_all if m.status == "playing"]
+            pending = [m for m in matches_all if m.status == "scheduled"]
+            done    = [m for m in matches_all if m.status == "done"]
 
-        txt += (
-            f"\n🔄 Раунд: {active_rnd.round_type}\n"
-            f"Столов: {tables_count}, В процессе: {len(playing)}, Завершено: {len(done)}\n"
-        )
+            txt += (
+                f"\n🔄 Раунд: {active_rnd.round_type}\n"
+                f"🏃 В процессе: {len(playing)}, ⏳ Осталось: {len(pending)}, ✅ Завершено: {len(done)}\n"
+            )
 
-        # Кнопки для каждой активной игры
-        for m in playing:
-            p1 = next(p for p in players if p.id == m.player1_id)
-            p2 = next(p for p in players if p.id == m.player2_id)
-            kb.append([InlineKeyboardButton(
-                f"{p1.name} : {p2.name}",
-                callback_data=f"match_{m.id}"
-            )])
+            # Кнопки для игр в процессе
+            for m in playing:
+                p1 = next(p for p in players if p.id == m.player1_id)
+                p2 = next(p for p in players if p.id == m.player2_id)
+                kb.append([InlineKeyboardButton(f"{p1.name} : {p2.name}", callback_data=f"match_{m.id}")])
 
-        # Если есть свободные столы — кнопка «▶️ Начать игру»
-        if len(playing) < tables_count:
-            kb.append([InlineKeyboardButton("▶️ Начать игру", callback_data="start_match")])
+            # Начать новую игру
+            if len(playing) < tour.data["tables"] and pending:
+                kb.append([InlineKeyboardButton("▶️ Начать игру", callback_data="start_match")])
 
-        # Если все игры завершены — кнопка «✅ Завершить раунд»
-        if len(done) == len(matches_all):
-            kb.append([InlineKeyboardButton("✅ Завершить раунд", callback_data="finish_round")])
+            # Завершить раунд
+            if len(done) == len(matches_all):
+                kb.append([InlineKeyboardButton("✅ Завершить раунд", callback_data="finish_round")])
 
+            # Показать распределение по таблицам
+            kb.append([InlineKeyboardButton("📋 Таблицы", callback_data=f"show_tables_{tid}")])
+
+    # Общая кнопка возврата
     kb.append([back_btn("home")])
 
-    # Отправляем или редактируем меню
+    # Отправка или редактирование сообщения
     if update.callback_query:
         await update.callback_query.answer()
         try:
@@ -410,9 +433,110 @@ async def send_tournament_menu(update, ctx, tid):
             raise
     else:
         await ctx.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
+            chat_id=update.effective_chat.id, text=txt,
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
         )
+
+# ---------- MATCH RES: ask for score ----------
+async def match_res(update, ctx):
+    await update.callback_query.answer()
+    _, mid, who = update.callback_query.data.split("_")
+    mid, who = int(mid), int(who)
+    # store for next step
+    ctx.user_data["pending_mid"] = mid
+    ctx.user_data["pending_who"] = who
+    # prompt for score
+    await update.callback_query.edit_message_text(
+        "📝 Введите счёт встречи (например, 11:7):",
+        reply_markup=ForceReply(selective=True)
+    )
+
+
+async def show_tables(update, ctx):
+    """
+    Показывает распределение по столам вместе с текущими баллами участников
+    во время простого раунда.
+    """
+    await update.callback_query.answer()
+    # извлекаем tid из callback_data "show_tables_<tid>"
+    tid = int(update.callback_query.data.split("_")[2])
+
+    async for s in get_session():
+        # берём последний простой раунд (pending или done)
+        simple = (await s.execute(
+            select(Round)
+            .where(
+                Round.tournament_id == tid,
+                Round.round_type == "simple"
+            )
+            .order_by(Round.created_at.desc())
+        )).scalars().first()
+        # все игроки турнира с текущими очками
+        players = (await s.execute(
+            select(Player).where(Player.tournament_id == tid)
+        )).scalars().all()
+
+    # маппинг id→Player
+    player_map = {p.id: p for p in players}
+    tables = simple.data["tables"]
+
+    # Формируем сообщение
+    msg = "📋 <b>Таблицы и текущие баллы:</b>\n\n"
+    for idx, tbl_ids in enumerate(tables, start=1):
+        msg += f"Таблица {idx}:\n"
+        for pid in tbl_ids:
+            p = player_map[pid]
+            # правильное склонение слова "балл"
+            suffix = "ов"
+            if p.score % 10 == 1 and p.score % 100 != 11:
+                suffix = ""
+            elif p.score % 10 in (2, 3, 4) and p.score % 100 not in (12, 13, 14):
+                suffix = "а"
+            msg += f"{p.name} — {p.score} балл{suffix}\n"
+        msg += "\n"
+
+    # кнопка "Назад" в меню турнира
+    kb = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"show_{tid}")]]
+    await update.callback_query.edit_message_text(
+        msg,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+# ---------- HANDLE SCORE INPUT ----------
+async def handle_match_score(update, ctx):
+    if "pending_mid" not in ctx.user_data:
+        return  # not in a match-result flow
+    score = update.message.text.strip()
+    mid = ctx.user_data.pop("pending_mid")
+    who = ctx.user_data.pop("pending_who")
+    ctx.user_data["pending_score"] = score
+
+    # fetch winner for confirmation text
+    async for s in get_session():
+        m = await s.get(Match, mid)
+        winner = await s.get(Player, m.player1_id if who==1 else m.player2_id)
+
+    kb = [[
+        InlineKeyboardButton(
+            f"✅ Подтвердить: {winner.name} победил ({score})",
+            callback_data=f"confirm_{mid}_{who}_{score}"
+        )
+    ], [
+        InlineKeyboardButton("❌ Отмена", callback_data=f"match_{mid}")
+    ]]
+    await update.message.reply_text(
+        "Подтвердите результат:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+
+
+
+
+
 
 
 async def start_match(update, ctx):
@@ -466,10 +590,7 @@ async def start_match(update, ctx):
 
     kb = [
         [
-            InlineKeyboardButton(
-                f"{player_map[m.player1_id].name} : {player_map[m.player2_id].name}",
-                callback_data=f"play_{m.id}"
-            )
+            InlineKeyboardButton( f"{player_map[m.player1_id].name} : {player_map[m.player2_id].name}", callback_data=f"play_{m.id}" )
         ]
         for m in pending
     ]
@@ -481,6 +602,46 @@ async def start_match(update, ctx):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+
+async def show_rounds_history(update, ctx):
+    """
+    Показывает все игры данного турнира (для завершённых турниров).
+    """
+    await update.callback_query.answer()
+    tid = int(update.callback_query.data.split("_")[1])
+
+    async for s in get_session():
+        # получить все раунды и матчи
+        rounds = (await s.execute(
+            select(Round).where(Round.tournament_id == tid).order_by(Round.created_at)
+        )).scalars().all()
+        all_matches = []
+        for rnd in rounds:
+            mlist = (await s.execute(
+                select(Match).where(Match.round_id == rnd.id)
+            )).scalars().all()
+            all_matches.extend(mlist)
+        # загрузить всех участвовавших игроков
+        pids = {pid for m in all_matches for pid in (m.player1_id, m.player2_id)}
+        players = (await s.execute(
+            select(Player).where(Player.id.in_(pids))
+        )).scalars().all()
+        player_map = {p.id: p.name for p in players}
+
+    # Формирование текста истории игр
+    text = "📖 <b>История игр:</b>\n"
+    for m in all_matches:
+        p1 = player_map[m.player1_id]
+        p2 = player_map[m.player2_id]
+        score = m.result.get("score", "-")
+        text += f"\n{p1} : {p2} — {score}"
+
+    # Кнопка назад в меню турнира
+    kb = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"show_{tid}")]]
+    await update.callback_query.edit_message_text(
+        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
+    )
+    
 
 async def start_match(update, ctx):
     logger.info("▶️ start_match called")
@@ -496,7 +657,6 @@ async def start_match(update, ctx):
         return
 
     async for s in get_session():
-        # 1) Найти активный раунд
         active_rnd = (await s.execute(
             select(Round).where(
                 Round.tournament_id == tid,
@@ -509,7 +669,6 @@ async def start_match(update, ctx):
             logger.info("start_match: no pending round, returning to menu")
             return await send_tournament_menu(update, ctx, tid)
 
-        # 2) Собрать все scheduled-матчи
         pending = (await s.execute(
             select(Match).where(
                 Match.round_id == active_rnd.id,
@@ -518,7 +677,6 @@ async def start_match(update, ctx):
         )).scalars().all()
         logger.info(f"start_match: pending matches count = {len(pending)}")
 
-        # 3) И все playing-матчи, чтобы узнать занятых игроков
         playing_matches = (await s.execute(
             select(Match).where(
                 Match.round_id == active_rnd.id,
@@ -533,7 +691,6 @@ async def start_match(update, ctx):
         }
         logger.info(f"start_match: currently playing player ids = {playing_ids}")
 
-        # 4) Фильтруем pending — оставляем только пары без занятых игроков
         available = [
             m for m in pending
             if m.player1_id not in playing_ids and m.player2_id not in playing_ids
@@ -547,7 +704,6 @@ async def start_match(update, ctx):
             )
             return await send_tournament_menu(update, ctx, tid)
 
-        # 5) Подгружаем данные игроков
         ids = {m.player1_id for m in available} | {m.player2_id for m in available}
         logger.info(f"start_match: loading players with ids = {ids}")
         players = (await s.execute(
@@ -556,7 +712,6 @@ async def start_match(update, ctx):
         player_map = {p.id: p for p in players}
         logger.info(f"start_match: loaded players = {list(player_map.keys())}")
 
-    # 6) Строим клавиатуру только из available-матчей
     kb = [
         [
             InlineKeyboardButton(
@@ -621,24 +776,55 @@ async def round_simple(update, ctx):
         return
     await update.callback_query.answer()
     tid = ctx.user_data["tid"]
+
+    # Создаём простой раунд и матчи
     async for s in get_session():
-        players = (await s.execute(select(Player).where(Player.tournament_id == tid).order_by(Player.score.desc()))).scalars().all()
+        # загружаем всех игроков, сортируя по текущему счету (но до первого раунда все 0)
+        players = (await s.execute(
+            select(Player)
+            .where(Player.tournament_id == tid)
+            .order_by(Player.score.desc())
+        )).scalars().all()
         n = len(players)
+        # определяем число столов: tcount чётно, и размер каждой группы от 4 до 7
         for tcount in range(2, n // 4 + 3, 2):
             size = -(-n // tcount)
             if 4 <= size <= 7:
                 break
-        tables = [[] for _ in range(tcount)]
+
+        # разбиваем по кругу
+        tables: list[list[Player]] = [[] for _ in range(tcount)]
         for p, idx in zip(players, cycle(range(tcount))):
             tables[idx].append(p)
-        rnd = Round(tournament_id=tid, round_type="simple", data={"tables": [[p.id for p in tbl] for tbl in tables]})
+
+        # сохраняем раунд
+        rnd = Round(
+            tournament_id=tid,
+            round_type="simple",
+            data={"tables": [[p.id for p in tbl] for tbl in tables]}
+        )
         s.add(rnd)
         await s.flush()
-        for idx, tbl in enumerate(tables, 1):
+
+        # создаём все пары внутри каждой таблицы
+        for idx, tbl in enumerate(tables, start=1):
             for p1, p2 in combinations(tbl, 2):
-                s.add(Match(round_id=rnd.id, table_number=idx, player1_id=p1.id, player2_id=p2.id))
-        await s.execute(sa_update(Tournament).where(Tournament.id == tid).values(status="active"))
+                s.add(Match(
+                    round_id=rnd.id,
+                    table_number=idx,
+                    player1_id=p1.id,
+                    player2_id=p2.id
+                ))
+
+        # ставим статус турниру "active"
+        await s.execute(
+            sa_update(Tournament)
+            .where(Tournament.id == tid)
+            .values(status="active")
+        )
         await s.commit()
+
+    # Показать меню турнира
     return await send_tournament_menu(update, ctx, tid)
 
 
@@ -648,79 +834,252 @@ async def round_final(update, ctx):
         return
     await update.callback_query.answer()
     tid = ctx.user_data["tid"]
+
     async for s in get_session():
+        # find latest completed simple round
         simple = (await s.execute(
-            select(Round).where(
+            select(Round)
+            .where(
                 Round.tournament_id == tid,
                 Round.round_type == "simple",
                 Round.status == "done"
-            ).order_by(Round.created_at.desc())
+            )
+            .order_by(Round.created_at.desc())
         )).scalars().first()
         if not simple:
-            return await update.callback_query.edit_message_text("❌ Сначала завершите простой раунд.")
+            return await update.callback_query.edit_message_text(
+                "❌ Сначала завершите простой раунд."
+            )
 
-        players = (await s.execute(select(Player).where(Player.tournament_id == tid).order_by(Player.score.desc()))).scalars().all()
-        if len(players) != 8:
-            return await update.callback_query.edit_message_text("❌ Итоговый только для 8 игроков.")
+        # load all players and split into the two tables
+        all_players = (await s.execute(
+            select(Player).where(Player.tournament_id == tid)
+        )).scalars().all()
+        table1_ids, table2_ids = simple.data["tables"][0], simple.data["tables"][1]
+        table1 = [p for p in all_players if p.id in table1_ids]
+        table2 = [p for p in all_players if p.id in table2_ids]
 
+        # sort each table by score descending
+        table1_sorted = sorted(table1, key=lambda p: p.score, reverse=True)
+        table2_sorted = sorted(table2, key=lambda p: p.score, reverse=True)
+
+        # bracket matches as specified:
         bracket = [
-            (players[0].id, players[7].id),
-            (players[1].id, players[6].id),
-            (players[4].id, players[3].id),
-            (players[5].id, players[2].id)
+            # 1 игра: 1 место 1 таблицы vs 4 место 2 таблицы
+            (table1_sorted[0].id, table2_sorted[3].id),
+            # 2 игра: 1 место 2 таблицы vs 4 место 1 таблицы
+            (table2_sorted[0].id, table1_sorted[3].id),
+            # 3 игра: 2 место 1 таблицы vs 3 место 2 таблицы
+            (table1_sorted[1].id, table2_sorted[2].id),
+            # 4 игра: 2 место 2 таблицы vs 3 место 1 таблицы
+            (table2_sorted[1].id, table1_sorted[2].id),
         ]
-        rnd = Round(tournament_id=tid, round_type="final", data={"matches": bracket})
+
+        # create final-round record
+        rnd = Round(
+            tournament_id=tid,
+            round_type="final",
+            data={"matches": bracket}
+        )
         s.add(rnd)
         await s.flush()
-        for idx, (a, b) in enumerate(bracket, 1):
-            s.add(Match(round_id=rnd.id, table_number=idx, player1_id=a, player2_id=b))
-        await s.execute(sa_update(Tournament).where(Tournament.id == tid).values(status="active"))
+
+        # schedule the 4 first matches
+        for idx, (a, b) in enumerate(bracket, start=1):
+            s.add(
+                Match(
+                    round_id=rnd.id,
+                    table_number=idx,
+                    player1_id=a,
+                    player2_id=b
+                )
+            )
+
+        # mark tournament active if not already
+        await s.execute(
+            sa_update(Tournament)
+            .where(Tournament.id == tid)
+            .values(status="active")
+        )
         await s.commit()
+
+    # return to the updated menu
     return await send_tournament_menu(update, ctx, tid)
+
+def build_scoreboard_markup(p1, p2, s1, s2, mid):
+    # Row for player1
+    row1 = []
+    if s1 > 0:
+        row1.append(InlineKeyboardButton("➖", callback_data=f"dec_{mid}_1"))
+    row1.append(InlineKeyboardButton(f"{p1.name}: {s1}", callback_data="noop"))
+    if s1 < 3:
+        row1.append(InlineKeyboardButton("➕", callback_data=f"inc_{mid}_1"))
+    # Row for player2
+    row2 = []
+    if s2 > 0:
+        row2.append(InlineKeyboardButton("➖", callback_data=f"dec_{mid}_2"))
+    row2.append(InlineKeyboardButton(f"{p2.name}: {s2}", callback_data="noop"))
+    if s2 < 3:
+        row2.append(InlineKeyboardButton("➕", callback_data=f"inc_{mid}_2"))
+    # Confirm button
+    row3 = [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_{mid}")]
+    return InlineKeyboardMarkup([row1, row2, row3])
+
+
 
 
 # ---------- MATCH ----------
 async def match_cb(update, ctx):
+    """
+    Entry point when user clicks on a match button.
+    Initializes scores and shows the interactive scoreboard.
+    """
     await update.callback_query.answer()
-    mid = int(update.callback_query.data.split("_")[1])
+    mid = int(update.callback_query.data.split("_", 1)[1])
+    # initialize scores
+    ctx.user_data["score_mid"] = mid
+    ctx.user_data["score_1"] = 0
+    ctx.user_data["score_2"] = 0
+
+    # load the two players
     async for s in get_session():
         m  = await s.get(Match, mid)
         p1 = await s.get(Player, m.player1_id)
         p2 = await s.get(Player, m.player2_id)
 
-    kb = [
-        [InlineKeyboardButton(f"{p1.name} победил", callback_data=f"res_{mid}_1")],
-        [InlineKeyboardButton(f"{p2.name} победил", callback_data=f"res_{mid}_2")],
-        [back_btn(f"show_{ctx.user_data['tid']}")]
-    ]
+    # show interactive keyboard
     await update.callback_query.edit_message_text(
-        "Выберите победителя:", reply_markup=InlineKeyboardMarkup(kb)
+        "📝 Установите счёт встречи:",
+        reply_markup=build_scoreboard_markup(p1, p2, 0, 0, mid)
     )
+
 
 
 
 async def match_res(update, ctx):
     await update.callback_query.answer()
-    _, mid, who = update.callback_query.data.split("_")
-    mid, who = int(mid), int(who)
-    async for s in get_session():
-        m      = await s.get(Match, mid)
-        winner = await s.get(Player, m.player1_id if who == 1 else m.player2_id)
+    mid = int(update.callback_query.data.split("_")[1])
+    ctx.user_data["score_mid"] = mid
+    ctx.user_data["score_1"] = 0
+    ctx.user_data["score_2"] = 0
 
-    kb = [
-        [InlineKeyboardButton("✅ Да", callback_data=f"confirm_{mid}_{who}")],
-        [InlineKeyboardButton("❌ Нет", callback_data=f"match_{mid}")]
-    ]
+    async for s in get_session():
+        m  = await s.get(Match, mid)
+        p1 = await s.get(Player, m.player1_id)
+        p2 = await s.get(Player, m.player2_id)
+
     await update.callback_query.edit_message_text(
-        f"Подтвердить: <b>{winner.name}</b> победил?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
+        "📝 Установите счёт встречи:",
+        reply_markup=build_scoreboard_markup(p1, p2, 0, 0, mid)
     )
 
-async def confirm_res(update, ctx):
-    logger.info(f"confirm_res called with data={update.callback_query.data}")
+
+
+
+async def adjust_score(update, ctx):
     await update.callback_query.answer()
-    _, mid, who = update.callback_query.data.split("_")
+    action, mid_str, idx_str = update.callback_query.data.split("_")
+    mid = int(mid_str)
+    key = f"score_{idx_str}"
+    # safely get current value
+    val = ctx.user_data.get(key, 0)
+    # adjust within [0,3]
+    if action == "inc" and val < 3:
+        val += 1
+    elif action == "dec" and val > 0:
+        val -= 1
+    ctx.user_data[key] = val
+
+    # reload players to rebuild keyboard
+    async for s in get_session():
+        m  = await s.get(Match, mid)
+        p1 = await s.get(Player, m.player1_id)
+        p2 = await s.get(Player, m.player2_id)
+
+    # attempt to update only the markup; ignore if unchanged
+    try:
+        await update.callback_query.edit_message_reply_markup(
+            build_scoreboard_markup(
+                p1, p2,
+                ctx.user_data.get("score_1", 0),
+                ctx.user_data.get("score_2", 0),
+                mid
+            )
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            return
+        raise
+
+
+
+async def confirm_score(update, ctx):
+    await update.callback_query.answer()
+    mid = ctx.user_data.pop("score_mid", None)
+    s1  = ctx.user_data.pop("score_1", 0)
+    s2  = ctx.user_data.pop("score_2", 0)
+    if mid is None:
+        return
+    # prevent tie
+    if s1 == s2:
+        return await update.callback_query.answer("Счёт не может быть ничейным", show_alert=True)
+
+    async for s in get_session():
+        m = await s.get(Match, mid)
+        # determine winner and loser
+        winner_id = m.player1_id if s1 > s2 else m.player2_id
+        loser_id  = m.player2_id if s1 > s2 else m.player1_id
+
+        # save result
+        m.result = {"winner": winner_id, "loser": loser_id, "score": f"{s1}:{s2}"}
+        m.status = "done"
+
+        # award points for simple rounds
+        rnd = await s.get(Round, m.round_id)
+        if rnd.round_type == "simple":
+            pw = await s.get(Player, winner_id)
+            pl = await s.get(Player, loser_id)
+            pw.score += 2
+            pl.score += 1
+
+        await s.commit()
+
+        # check if round is fully done
+        allm = (await s.execute(select(Match).where(Match.round_id == rnd.id))).scalars().all()
+        if all(x.status == "done" for x in allm):
+            rnd.status = "done"
+            await s.commit()
+            # if it was a simple round, send separate summary
+            if rnd.round_type == "simple":
+                # load all players and table distribution
+                players = (await s.execute(
+                    select(Player).where(Player.tournament_id == rnd.tournament_id)
+                )).scalars().all()
+                player_map = {p.id: p for p in players}
+                tables = rnd.data["tables"]
+                summary = "📋 Итоги простого раунда:\n"
+                for idx, tbl_ids in enumerate(tables, start=1):
+                    summary += f"\n{idx} Таблица:\n"
+                    tbl_players = [player_map[pid] for pid in tbl_ids]
+                    tbl_sorted = sorted(tbl_players, key=lambda p: p.score, reverse=True)
+                    for place, p in enumerate(tbl_sorted, start=1):
+                        summary += f"{place} место – {p.name} – {p.score} балл{'ов' if p.score % 10 in (2,3,4) else ''}\n"
+                # send the summary as a separate message
+                await ctx.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=summary,
+                    parse_mode="HTML"
+                )
+
+    # return to tournament menu
+    return await send_tournament_menu(update, ctx, ctx.user_data["tid"])
+
+async def noop_callback(update, ctx):
+    await update.callback_query.answer()
+
+async def confirm_res(update, ctx):
+    await update.callback_query.answer()
+    _, mid, who, score = update.callback_query.data.split("_", 3)
     mid, who = int(mid), int(who)
 
     async for s in get_session():
@@ -728,10 +1087,10 @@ async def confirm_res(update, ctx):
         if m.status != "playing":
             return await send_tournament_menu(update, ctx, ctx.user_data["tid"])
 
-        winner_id = m.player1_id if who == 1 else m.player2_id
-        loser_id  = m.player2_id if who == 1 else m.player1_id
+        winner_id = m.player1_id if who== "1" else m.player2_id
+        loser_id  = m.player2_id if who== "1" else m.player1_id
 
-        m.result = {"winner": winner_id, "loser": loser_id}
+        m.result = {"winner": winner_id, "loser": loser_id, "score": score}
         m.status = "done"
 
         rnd = await s.get(Round, m.round_id)
@@ -743,13 +1102,14 @@ async def confirm_res(update, ctx):
 
         await s.commit()
 
-        # если все матчи закрыты — завершаем раунд
-        allm = (await s.execute(select(Match).where(Match.round_id == rnd.id))).scalars().all()
-        if all(x.status == "done" for x in allm):
+        allm = (await s.execute(select(Match).where(Match.round_id==rnd.id))).scalars().all()
+        if all(x.status=="done" for x in allm):
             rnd.status = "done"
             await s.commit()
 
     return await send_tournament_menu(update, ctx, ctx.user_data["tid"])
+
+
 
 async def finish_round(update, ctx):
     return await send_tournament_menu(update, ctx, ctx.user_data["tid"])
@@ -768,8 +1128,7 @@ async def settings_cb(update, ctx):
         kb.append([InlineKeyboardButton("👥 Список админов", callback_data="list_admins")])
     kb.append([InlineKeyboardButton("✏️ Сменить логин", callback_data="change_login")])
     kb.append([InlineKeyboardButton("🔒 Сменить пароль", callback_data="change_pass")])
-    kb.append([InlineKeyboardButton("🚪 Выйти", callback_data="logout")])
-    kb.append([back_btn("home")])
+    kb.append([back_btn("home"), InlineKeyboardButton("🚪 Выйти", callback_data="logout")])
     text = f"⚙️ Настройки\nТекущий логин: <b>{adm.username}</b>"
     await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -798,9 +1157,7 @@ async def logout(update, ctx):
     try:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
     except BadRequest:
-        await ctx.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=text,
-                                   reply_markup=InlineKeyboardMarkup(kb))
+        await ctx.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=InlineKeyboardMarkup(kb))
 
     return ConversationHandler.END
 
@@ -909,6 +1266,19 @@ async def change_pass_start(update, ctx):
     return CHP_OLD
 
 
+async def end_tournament(update, ctx):
+    await update.callback_query.answer("🏁 Турнир завершён")
+    tid = ctx.user_data.get("tid")
+    async for s in get_session():
+        await s.execute(
+            sa_update(Tournament)
+            .where(Tournament.id==tid)
+            .values(status="ended", finished_at=func.now())
+        )
+        await s.commit()
+    # show final summary or go to home
+    return await show_home(update, ctx)
+
 async def change_pass_old(update, ctx):
     old = update.message.text.strip()
     if old.lower() == "назад":
@@ -1014,18 +1384,25 @@ def main():
     app.add_handler(CommandHandler("back", show_home))
     app.add_handler(CallbackQueryHandler(history_cb, pattern="^hist$"))
     app.add_handler(CallbackQueryHandler(active_cb, pattern="^act$"))
-
+    app.add_handler(CallbackQueryHandler(show_rounds_history, pattern="^rounds_\\d+$"))
     app.add_handler(CallbackQueryHandler(show_tournament, pattern="^show_\\d+$"))
     app.add_handler(CallbackQueryHandler(export_json, pattern="^exp_json$"))
 
-    app.add_handler(CallbackQueryHandler(round_simple, pattern="^round_simple$"))
-    app.add_handler(CallbackQueryHandler(start_match, pattern="^start_match$"))
-    app.add_handler(CallbackQueryHandler(round_final, pattern="^round_final$"))
-    app.add_handler(CallbackQueryHandler(play_match,  pattern="^play_\\d+$"))
-    app.add_handler(CallbackQueryHandler(confirm_res, pattern=r"^confirm_\d+_[12]$"))
-    app.add_handler(CallbackQueryHandler(match_cb, pattern="^match_\\d+$"))
-    app.add_handler(CallbackQueryHandler(match_res, pattern="^res_\\d+_[12]$"))
-    app.add_handler(CallbackQueryHandler(finish_round, pattern="^finish_round$"))
+    app.add_handler(CallbackQueryHandler(round_simple,    pattern="^round_simple$"))
+    app.add_handler(CallbackQueryHandler(start_match,     pattern="^start_match$"))
+    app.add_handler(CallbackQueryHandler(round_final,     pattern="^round_final$"))
+    app.add_handler(CallbackQueryHandler(play_match,      pattern="^play_\\d+$"))
+    app.add_handler(CallbackQueryHandler(match_res,       pattern=r"^res_\d+_[12]$"))
+    app.add_handler(CallbackQueryHandler(show_tables, pattern=r"^show_tables_\d+$"))
+    app.add_handler(CallbackQueryHandler(match_res,     pattern=r"^res_\d+_[12]$"))
+    app.add_handler(CallbackQueryHandler(match_cb,        pattern=r"^match_\d+$"))
+    app.add_handler(CallbackQueryHandler(adjust_score,   pattern=r"^(?:inc|dec)_\d+_[12]$"))
+    app.add_handler(CallbackQueryHandler(confirm_score,  pattern=r"^confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(noop_callback,  pattern="^noop$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_match_score), group=1)
+    app.add_handler(CallbackQueryHandler(confirm_res,     pattern=r"^confirm_\d+_[12]_.+$"))
+    app.add_handler(CallbackQueryHandler(end_tournament,  pattern="^end_tournament$"))
+    app.add_handler(CallbackQueryHandler(finish_round,    pattern="^finish_round$"))
 
     app.add_handler(CallbackQueryHandler(settings_cb, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(gen_code, pattern="^gen_code$"))
